@@ -11,7 +11,7 @@ use diesel_dynamic_schema::{schema, Column, Table as DynamicTable};
 use graph::data::subgraph::schema::SUBGRAPHS_ID;
 use graph::prelude::{
     format_err, AttributeIndexDefinition, EntityChange, EntityChangeOperation, EntityFilter,
-    EntityKey, Error, EventSource, QueryExecutionError, StoreError, StoreEvent,
+    EntityKey, Error, EventSource, HistoryEvent, QueryExecutionError, StoreError, StoreEvent,
     SubgraphDeploymentId, TransactionAbortError, ValueType,
 };
 use graph::serde_json;
@@ -291,6 +291,14 @@ impl<'a> Connection<'a> {
     pub(crate) fn count_entities(&self, subgraph: &SubgraphDeploymentId) -> Result<u64, Error> {
         let table = self.table(subgraph)?;
         table.count_entities(self.conn)
+    }
+
+    pub(crate) fn create_history_event(
+        &self,
+        subgraph: SubgraphDeploymentId,
+        event_source: EventSource,
+    ) -> Result<HistoryEvent, Error> {
+        create_history_event(self.conn, subgraph, event_source)
     }
 }
 
@@ -1023,4 +1031,42 @@ pub(crate) fn drop_schema(
     } else {
         Ok(0)
     }
+}
+
+/// Ensures a history event exists for the current transaction and returns its ID.
+fn create_history_event(
+    conn: &diesel::pg::PgConnection,
+    subgraph: SubgraphDeploymentId,
+    event_source: EventSource,
+) -> Result<HistoryEvent, Error> {
+    #[derive(Queryable, Debug)]
+    struct Event {
+        id: i32,
+    };
+
+    impl QueryableByName<Pg> for Event {
+        fn build<R: diesel::row::NamedRow<Pg>>(row: &R) -> diesel::deserialize::Result<Self> {
+            Ok(Event {
+                id: row.get("event_id")?,
+            })
+        }
+    }
+
+    let result: Event = diesel::sql_query(
+        "insert into event_meta_data (
+             db_transaction_id, db_transaction_time, source
+         )
+         values (
+             txid_current(), statement_timestamp(), $1
+         )
+         returning event_meta_data.id as event_id",
+    )
+    .bind::<Text, _>(event_source.to_string())
+    .get_result(conn)?;
+
+    Ok(HistoryEvent {
+        id: result.id,
+        subgraph,
+        source: event_source,
+    })
 }
