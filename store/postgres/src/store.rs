@@ -417,7 +417,7 @@ impl Store {
         conn: &e::Connection,
         key: EntityKey,
         data: Entity,
-        event_source: EventSource,
+        history_event: Option<&HistoryEvent>,
     ) -> Result<(), StoreError> {
         self.check_interface_entity_uniqueness(conn, &key)?;
 
@@ -425,6 +425,9 @@ impl Store {
         let existing_entity = self
             .get_entity(conn, &key.subgraph_id, &key.entity_type, &key.entity_id)
             .map_err(Error::from)?;
+
+        // Identify whether this is an insert or an update operation.
+        let is_update = existing_entity.is_some();
 
         // Apply the operation
         let operation = EntityOperation::Set {
@@ -443,19 +446,23 @@ impl Store {
                 )
             })?;
 
-        // Either add or update the entity in Postgres
-        conn.upsert(&key, &updated_json, event_source)
-            .map(|_| ())
-            .map_err(|e| {
-                format_err!(
-                    "Failed to set entity ({}, {}, {}): {}",
-                    key.subgraph_id,
-                    key.entity_type,
-                    key.entity_id,
-                    e
-                )
-                .into()
-            })
+        // Either insert or update the entity in Postgres
+        let result = if is_update {
+            conn.update(&key, &updated_json, None, history_event)
+        } else {
+            conn.insert(&key, &updated_json, history_event)
+        };
+
+        result.map(|_| ()).map_err(|e| {
+            format_err!(
+                "Failed to set entity ({}, {}, {}): {}",
+                key.subgraph_id,
+                key.entity_type,
+                key.entity_id,
+                e
+            )
+            .into()
+        })
     }
 
     /// Applies an update operation to an existing entity
@@ -465,7 +472,7 @@ impl Store {
         key: EntityKey,
         data: Entity,
         guard: Option<EntityFilter>,
-        event_source: EventSource,
+        history_event: Option<&HistoryEvent>,
     ) -> Result<(), StoreError> {
         self.check_interface_entity_uniqueness(conn, &key)?;
 
@@ -480,7 +487,7 @@ impl Store {
         })?;
 
         // Update the entity in Postgres
-        match conn.update(&key, &json, guard, event_source)? {
+        match conn.update(&key, &json, guard, history_event)? {
             0 => Err(TransactionAbortError::AbortUnless {
                 expected_entity_ids: vec![key.entity_id.clone()],
                 actual_entity_ids: vec![],
@@ -502,9 +509,9 @@ impl Store {
         &self,
         conn: &e::Connection,
         key: EntityKey,
-        event_source: EventSource,
+        history_event: Option<&HistoryEvent>,
     ) -> Result<(), StoreError> {
-        conn.delete(&key, event_source).map(|_| ()).map_err(|e| {
+        conn.delete(&key, history_event).map(|_| ()).map_err(|e| {
             format_err!(
                 "Failed to remove entity ({}, {}, {}): {}",
                 key.subgraph_id,
@@ -522,7 +529,7 @@ impl Store {
         description: String,
         query: EntityQuery,
         mut expected_entity_ids: Vec<String>,
-        _event_source: EventSource,
+        _history_event: Option<&HistoryEvent>,
     ) -> Result<(), StoreError> {
         // Execute query
         let actual_entities = self.execute_query(conn, query.clone()).map_err(|e| {
@@ -567,16 +574,18 @@ impl Store {
         &self,
         conn: &e::Connection,
         operation: EntityOperation,
-        event_source: EventSource,
+        history_event: Option<&HistoryEvent>,
     ) -> Result<(), StoreError> {
         match operation {
             EntityOperation::Set { key, data } => {
-                self.apply_set_operation(conn, key, data, event_source)
+                self.apply_set_operation(conn, key, data, history_event)
             }
             EntityOperation::Update { key, data, guard } => {
-                self.apply_update_operation(conn, key, data, guard, event_source)
+                self.apply_update_operation(conn, key, data, guard, history_event)
             }
-            EntityOperation::Remove { key } => self.apply_remove_operation(conn, key, event_source),
+            EntityOperation::Remove { key } => {
+                self.apply_remove_operation(conn, key, history_event)
+            }
             EntityOperation::AbortUnless {
                 description,
                 query,
@@ -586,7 +595,7 @@ impl Store {
                 description,
                 query,
                 entity_ids,
-                event_source,
+                history_event,
             ),
         }
     }
@@ -596,10 +605,10 @@ impl Store {
         &self,
         conn: &e::Connection,
         operations: Vec<EntityOperation>,
-        event_source: EventSource,
+        history_event: Option<&HistoryEvent>,
     ) -> Result<(), StoreError> {
         for operation in operations.into_iter() {
-            self.apply_entity_operation(conn, operation, event_source)?;
+            self.apply_entity_operation(conn, operation, history_event.clone())?;
         }
         Ok(())
     }
@@ -735,7 +744,7 @@ impl StoreTrait for Store {
             block_ptr_from,
             block_ptr_to,
         );
-        self.apply_entity_operations(ops, EventSource::None)
+        self.apply_entity_operations(ops, None)
     }
 
     fn transact_block_operations(
@@ -766,9 +775,12 @@ impl StoreTrait for Store {
         let econn = e::Connection::new(&conn);
 
         conn.transaction(|| {
-            // Apply the entity operations with the new block as the event source
+            // Ensure the history event exists in the database
             let event_source = EventSource::EthereumBlock(block_ptr_to);
-            self.apply_entity_operations_with_conn(&econn, operations, event_source)?;
+            let history_event = econn.create_history_event(subgraph_id.clone(), event_source)?;
+
+            // Apply the entity operations with the new block as the event source
+            self.apply_entity_operations_with_conn(&econn, operations, Some(&history_event))?;
 
             // Update the subgraph block pointer, without an event source; this way
             // no entity history is recorded for the block pointer update itself
@@ -777,20 +789,20 @@ impl StoreTrait for Store {
                 block_ptr_from,
                 block_ptr_to,
             );
-            self.apply_entity_operations_with_conn(&econn, block_ptr_ops, EventSource::None)
+            self.apply_entity_operations_with_conn(&econn, block_ptr_ops, None)
         })
     }
 
     fn apply_entity_operations(
         &self,
         operations: Vec<EntityOperation>,
-        event_source: EventSource,
+        history_event: Option<HistoryEvent>,
     ) -> Result<(), StoreError> {
         let conn = self.conn.get().map_err(Error::from)?;
         let econn = e::Connection::new(&conn);
         conn.transaction(|| {
             self.emit_store_events(&conn, &operations)?;
-            self.apply_entity_operations_with_conn(&econn, operations, event_source)
+            self.apply_entity_operations_with_conn(&econn, operations, history_event.as_ref())
         })
     }
 
@@ -823,7 +835,7 @@ impl StoreTrait for Store {
                 block_ptr_to,
             );
             self.emit_store_events(&conn, &ops)?;
-            self.apply_entity_operations_with_conn(&econn, ops, EventSource::None)?;
+            self.apply_entity_operations_with_conn(&econn, ops, None)?;
 
             let event = econn.revert_block(&subgraph_id, block_ptr_from.hash_hex())?;
 
@@ -876,9 +888,8 @@ impl StoreTrait for Store {
         let econn = e::Connection::new(&conn);
 
         conn.transaction(|| {
-            let source = EventSource::None;
             self.emit_store_events(&conn, &ops)?;
-            self.apply_entity_operations_with_conn(&econn, ops, source)?;
+            self.apply_entity_operations_with_conn(&econn, ops, None)?;
             crate::entities::create_schema(&conn, subgraph_id)
         })
     }
