@@ -944,6 +944,30 @@ impl Table {
         conn: &PgConnection,
         block_ptr: String,
     ) -> Result<StoreEvent, StoreError> {
+        // Collect entity history events for the subgraph of subgraphs that
+        // match the subgraph for which we're reverting the block
+        let subgraphs_entries: Vec<RawHistory> = match self {
+            // Tracking history for the subgraph of subgraphs was only added after
+            // splitting up the entities table; hence no subgraph in the public
+            // entities table supports it
+            Table::Public(_) => vec![],
+
+            Table::Split(entities) => {
+                use self::subgraphs::entity_history::dsl as h;
+                use self::subgraphs::event_meta_data as m;
+
+                h::entity_history
+                    .inner_join(m::table)
+                    .select((h::id, h::entity, h::entity_id, h::data_before, h::op_id))
+                    .filter(h::subgraph.eq(&*entities.subgraph))
+                    .filter(m::source.eq(&block_ptr))
+                    .order(h::event_id.desc())
+                    .load(conn)?
+            }
+        };
+
+        // Collect entity history events for the subgraph for which we're
+        // reverting the block
         let entries: Vec<RawHistory> = match self {
             Table::Public(subgraph) => {
                 use self::public::entity_history::dsl as h;
@@ -981,52 +1005,12 @@ impl Table {
             Table::Split(entities) => entities.subgraph.clone(),
         };
 
-        let mut changes = Vec::with_capacity(entries.len());
-        for history in entries.into_iter() {
-            // Perform the actual reversion
-            let key = self.entity_key(history.entity.clone(), history.entity_id.clone());
-            match history.op {
-                0 => {
-                    // Reverse an insert
-                    self.delete(conn, &key, None)?;
-                }
-                1 | 2 => {
-                    // Reverse an update or delete
-                    if let Some(data) = history.data {
-                        self.upsert(conn, &key, &data, None)?;
-                    } else {
-                        return Err(StoreError::Unknown(format_err!(
-                            "History entry for update/delete has NULL data_before. id={}, op={}",
-                            history.id,
-                            history.op
-                        )));
-                    }
-                }
-                _ => {
-                    return Err(StoreError::Unknown(format_err!(
-                        "bad operation {}",
-                        history.op
-                    )))
-                }
-            }
-            // Record the change that was just made
-            let change = EntityChange {
-                subgraph_id: subgraph_id.clone(),
-                entity_type: history.entity,
-                entity_id: history.entity_id,
-                operation: match history.op {
-                    0 => EntityChangeOperation::Removed,
-                    1 | 2 => EntityChangeOperation::Set,
-                    _ => {
-                        return Err(StoreError::Unknown(format_err!(
-                            "bad operation {}",
-                            history.op
-                        )))
-                    }
-                },
-            };
-            changes.push(change);
-        }
+        let subgraphs_id = SubgraphDeploymentId::new("subgraphs").unwrap();
+
+        // Apply
+        let mut changes = Vec::with_capacity(subgraphs_entries.len() + entries.len());
+        self.revert_entity_history_records(conn, &subgraphs_id, &mut changes, subgraphs_entries)?;
+        self.revert_entity_history_records(conn, &subgraph_id, &mut changes, entries)?;
 
         Ok(StoreEvent::new(changes))
     }
@@ -1119,6 +1103,62 @@ impl Table {
                 Ok(1)
             }
         }
+    }
+
+    fn revert_entity_history_records(
+        &self,
+        conn: &PgConnection,
+        subgraph_id: &SubgraphDeploymentId,
+        changes: &mut Vec<EntityChange>,
+        records: Vec<RawHistory>,
+    ) -> Result<(), StoreError> {
+        for history in records.into_iter() {
+            // Perform the actual reversion
+            let key = self.entity_key(history.entity.clone(), history.entity_id.clone());
+            match history.op {
+                0 => {
+                    // Reverse an insert
+                    self.delete(conn, &key, None)?;
+                }
+                1 | 2 => {
+                    // Reverse an update or delete
+                    if let Some(data) = history.data {
+                        self.upsert(conn, &key, &data, None)?;
+                    } else {
+                        return Err(StoreError::Unknown(format_err!(
+                            "History entry for update/delete has NULL data_before. id={}, op={}",
+                            history.id,
+                            history.op
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(StoreError::Unknown(format_err!(
+                        "bad operation {}",
+                        history.op
+                    )))
+                }
+            }
+            // Record the change that was just made
+            let change = EntityChange {
+                subgraph_id: subgraph_id.clone(),
+                entity_type: history.entity,
+                entity_id: history.entity_id,
+                operation: match history.op {
+                    0 => EntityChangeOperation::Removed,
+                    1 | 2 => EntityChangeOperation::Set,
+                    _ => {
+                        return Err(StoreError::Unknown(format_err!(
+                            "bad operation {}",
+                            history.op
+                        )))
+                    }
+                },
+            };
+            changes.push(change);
+        }
+
+        Ok(())
     }
 }
 
