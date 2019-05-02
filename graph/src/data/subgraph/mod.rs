@@ -68,6 +68,12 @@ impl SubgraphDeploymentId {
             link: format!("/ipfs/{}", self),
         }
     }
+
+    /// Return true if this is the id of the special
+    /// "subgraph of subgraphs" that contains metadata about everything
+    pub fn is_meta(&self) -> bool {
+        self.0 == "subgraphs"
+    }
 }
 
 impl Deref for SubgraphDeploymentId {
