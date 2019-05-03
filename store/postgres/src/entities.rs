@@ -8,6 +8,10 @@ use diesel::ExpressionMethods;
 use diesel::{debug_query, insert_into};
 use diesel::{OptionalExtension, QueryDsl, RunQueryDsl};
 use diesel_dynamic_schema::{schema, Column, Table as DynamicTable};
+use inflector::cases::snakecase::to_snake_case;
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use graph::data::subgraph::schema::SUBGRAPHS_ID;
 use graph::prelude::{
     format_err, AttributeIndexDefinition, EntityChange, EntityChangeOperation, EntityFilter,
@@ -15,9 +19,7 @@ use graph::prelude::{
     SubgraphDeploymentId, TransactionAbortError, ValueType,
 };
 use graph::serde_json;
-use inflector::cases::snakecase::to_snake_case;
-use std::cell::RefCell;
-use std::collections::HashMap;
+use graph::util::extend::Extend;
 
 use crate::filter::{build_filter, store_filter};
 use crate::functions::set_config;
@@ -193,7 +195,7 @@ pub(crate) struct SplitTable {
     event_source: EntityColumn<diesel::sql_types::Text>,
 }
 
-#[derive(Queryable)]
+#[derive(Debug, Queryable)]
 struct RawHistory {
     id: i32,
     entity: String,
@@ -343,8 +345,13 @@ impl<'a> Connection<'a> {
         subgraph: &SubgraphDeploymentId,
         block_ptr: String,
     ) -> Result<StoreEvent, StoreError> {
+        // First revert the block in the subgraph itself
         let table = self.table(subgraph)?;
-        table.revert_block(self.conn, block_ptr)
+        let event = table.revert_block(self.conn, block_ptr.clone())?;
+
+        // The revert the meta data changes that correspond to this subgraph
+        let table = self.table(&SUBGRAPHS_ID)?;
+        Ok(event.extend(table.revert_block_meta(self.conn, subgraph, block_ptr)?))
     }
 
     pub(crate) fn count_entities(&self, subgraph: &SubgraphDeploymentId) -> Result<u64, Error> {
@@ -904,7 +911,7 @@ impl Table {
                 schema, schema,
             ))
             .bind::<Integer, _>(history_event.id)
-            .bind::<Text, _>(&schema)
+            .bind::<Text, _>(&*history_event.subgraph)
             .bind::<Text, _>(&key.entity_type)
             .bind::<Text, _>(&key.entity_id)
             .bind::<Bool, _>(&reversion)
@@ -936,6 +943,48 @@ impl Table {
 
         Ok(())
     }
+
+    fn revert_block_meta(
+        &self,
+        conn: &PgConnection,
+        subgraph_id: &SubgraphDeploymentId,
+        block_ptr: String,
+    ) -> Result<StoreEvent, StoreError> {
+        // Collect entity history events in the subgraph of subgraphs that
+        // match the subgraph for which we're reverting the block
+        let entries: Vec<RawHistory> = match self {
+            Table::Public(_) => {
+                use self::subgraphs::entity_history::dsl as h;
+                use self::subgraphs::event_meta_data as m;
+
+                h::entity_history
+                    .inner_join(m::table)
+                    .select((h::id, h::entity, h::entity_id, h::data_before, h::op_id))
+                    .filter(h::subgraph.eq(&**subgraph_id))
+                    .filter(m::source.eq(&block_ptr))
+                    .order(h::event_id.desc())
+                    .load(conn)?
+            }
+
+            Table::Split(_) => {
+                use self::subgraphs::entity_history::dsl as h;
+                use self::subgraphs::event_meta_data as m;
+
+                h::entity_history
+                    .inner_join(m::table)
+                    .select((h::id, h::entity, h::entity_id, h::data_before, h::op_id))
+                    .filter(h::subgraph.eq(&**subgraph_id))
+                    .filter(m::source.eq(&block_ptr))
+                    .order(h::event_id.desc())
+                    .load(conn)?
+            }
+        };
+
+        // Apply revert operations
+        self.revert_entity_history_records(conn, entries)
+            .map(|changes| StoreEvent::new(changes))
+    }
+
     /// Revert the block with the given `block_ptr` which must be the hash
     /// of the block to revert. The returned `StoreEvent` reflects the changes
     /// that were made during reversion
@@ -944,28 +993,6 @@ impl Table {
         conn: &PgConnection,
         block_ptr: String,
     ) -> Result<StoreEvent, StoreError> {
-        // Collect entity history events for the subgraph of subgraphs that
-        // match the subgraph for which we're reverting the block
-        let subgraphs_entries: Vec<RawHistory> = match self {
-            // Tracking history for the subgraph of subgraphs was only added after
-            // splitting up the entities table; hence no subgraph in the public
-            // entities table supports it
-            Table::Public(_) => vec![],
-
-            Table::Split(entities) => {
-                use self::subgraphs::entity_history::dsl as h;
-                use self::subgraphs::event_meta_data as m;
-
-                h::entity_history
-                    .inner_join(m::table)
-                    .select((h::id, h::entity, h::entity_id, h::data_before, h::op_id))
-                    .filter(h::subgraph.eq(&*entities.subgraph))
-                    .filter(m::source.eq(&block_ptr))
-                    .order(h::event_id.desc())
-                    .load(conn)?
-            }
-        };
-
         // Collect entity history events for the subgraph for which we're
         // reverting the block
         let entries: Vec<RawHistory> = match self {
@@ -1000,19 +1027,9 @@ impl Table {
             }
         };
 
-        let subgraph_id = match self {
-            Table::Public(subgraph) => subgraph.clone(),
-            Table::Split(entities) => entities.subgraph.clone(),
-        };
-
-        let subgraphs_id = SubgraphDeploymentId::new("subgraphs").unwrap();
-
-        // Apply
-        let mut changes = Vec::with_capacity(subgraphs_entries.len() + entries.len());
-        self.revert_entity_history_records(conn, &subgraphs_id, &mut changes, subgraphs_entries)?;
-        self.revert_entity_history_records(conn, &subgraph_id, &mut changes, entries)?;
-
-        Ok(StoreEvent::new(changes))
+        // Apply revert operations
+        self.revert_entity_history_records(conn, entries)
+            .map(|changes| StoreEvent::new(changes))
     }
 
     fn build_attribute_index(
@@ -1108,10 +1125,15 @@ impl Table {
     fn revert_entity_history_records(
         &self,
         conn: &PgConnection,
-        subgraph_id: &SubgraphDeploymentId,
-        changes: &mut Vec<EntityChange>,
         records: Vec<RawHistory>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Vec<EntityChange>, StoreError> {
+        let subgraph_id = match self {
+            Table::Public(subgraph) => subgraph.clone(),
+            Table::Split(entities) => entities.subgraph.clone(),
+        };
+
+        let mut changes = vec![];
+
         for history in records.into_iter() {
             // Perform the actual reversion
             let key = self.entity_key(history.entity.clone(), history.entity_id.clone());
@@ -1158,7 +1180,7 @@ impl Table {
             changes.push(change);
         }
 
-        Ok(())
+        Ok(changes)
     }
 }
 
