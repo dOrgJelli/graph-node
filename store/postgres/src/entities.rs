@@ -2,7 +2,7 @@ use diesel::connection::SimpleConnection;
 use diesel::deserialize::QueryableByName;
 use diesel::dsl::{any, sql};
 use diesel::pg::{Pg, PgConnection};
-use diesel::sql_types::{Jsonb, Nullable, Text};
+use diesel::sql_types::{Integer, Jsonb, Nullable, Text};
 use diesel::BoolExpressionMethods;
 use diesel::ExpressionMethods;
 use diesel::{debug_query, insert_into};
@@ -288,6 +288,10 @@ impl<'a> Connection<'a> {
         table.revert_block(self.conn, block_ptr)
     }
 
+    /// Count the number of entities in a subgraph. This performs an actual count,
+    /// and will therefore be slow. As a side-effect, the `entityCount` attribute
+    /// of the SubgraphDeployment entity for this subgraph will be set
+    /// to the resulting count
     pub(crate) fn count_entities(&self, subgraph: &SubgraphDeploymentId) -> Result<u64, Error> {
         let table = self.table(subgraph)?;
         table.count_entities(self.conn)
@@ -298,8 +302,15 @@ impl<'a> Connection<'a> {
         subgraph: Option<SubgraphDeploymentId>,
         count: i32,
     ) -> Result<(), StoreError> {
-        // TODO: still needs to be implemented
-        Ok(())
+        if count == 0 {
+            return Ok(());
+        }
+        if let Some(subgraph) = subgraph {
+            let table = self.table(&subgraph)?;
+            table.update_entity_count(self.conn, subgraph, count)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -430,7 +441,7 @@ impl Table {
     fn find(
         &self,
         conn: &PgConnection,
-        entity: &String,
+        entity: &str,
         id: &String,
     ) -> Result<Option<serde_json::Value>, StoreError> {
         match self {
@@ -686,20 +697,72 @@ impl Table {
     }
 
     fn count_entities(&self, conn: &PgConnection) -> Result<u64, Error> {
-        match self {
+        let (count, subgraph) = match self {
             Table::Public(subgraph) => {
                 let count: i64 = public::entities::table
                     .filter(public::entities::subgraph.eq(subgraph.to_string()))
                     .count()
                     .get_result(conn)?;
-                Ok(count as u64)
+                (count as u64, subgraph)
             }
             Table::Split(entities) => {
                 let table = entities.table.clone();
                 let count: i64 = table.count().get_result(conn)?;
-                Ok(count as u64)
+                (count as u64, &entities.subgraph)
             }
-        }
+        };
+        let query = format!(
+            "
+            update subgraphs.entities
+            set data = data || '{{\"entityCount\": {{ \"data\": {}, 
+                                                      \"type\": \"Int\"}}}}'::jsonb
+            where entity='SubgraphDeployment'
+              and id = $1
+            ",
+            count
+        );
+        diesel::sql_query(query)
+            .bind::<Text, _>(subgraph.to_string())
+            .execute(conn)?;
+        Ok(count)
+    }
+
+    pub(crate) fn update_entity_count(
+        &self,
+        conn: &PgConnection,
+        subgraph: SubgraphDeploymentId,
+        count: i32,
+    ) -> Result<(), StoreError> {
+        let count_query = match self {
+            Table::Public(_) => format!(
+                "select count(*) from public.entities where subgraph = '{}'",
+                &subgraph
+            ),
+            Table::Split(entities) => format!("select count(*) from {}.entities", entities.schema),
+        };
+        // This query is pretty complicated since we try to cover both
+        // the case when we do not have an entityCount yet, and when we
+        // do have an entity count without roundtripping lots of data
+        // to the server. Note that `coalesce` only evaluates the arguments
+        // it needs, so that in the case where we already have an entityCount
+        // we do not needlessly cause a count of entities
+        let query = format!(
+            "
+            update subgraphs.entities
+            set data = data || (format('{{\"entityCount\":
+                                  {{ \"data\": %s, 
+                                    \"type\": \"Int\"}}}}',
+                                  coalesce((data->'entityCount'->>'data')::int, ({})) + $1))::jsonb
+            where entity='SubgraphDeployment'
+              and id = $2
+            ",
+            count_query
+        );
+        Ok(diesel::sql_query(query)
+            .bind::<Integer, _>(count)
+            .bind::<Text, _>(subgraph.to_string())
+            .execute(conn)
+            .map(|_| ())?)
     }
 
     fn conflicting_entity(

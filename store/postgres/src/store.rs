@@ -906,7 +906,26 @@ impl StoreTrait for Store {
         let conn = &*self.conn.get()?;
         let conn = e::Connection::new(&conn);
 
-        conn.count_entities(&subgraph_id)
+        let data = self.get_entity(
+            &conn,
+            &*SUBGRAPHS_ID,
+            &"SubgraphDeployment".to_owned(),
+            &subgraph_id.to_string(),
+        )?;
+        let count = match data {
+            None => Some(0), // The subgraph does not exist
+            Some(data) => match data.get("entityCount") {
+                None => None, // No 'entityCount' attribute
+                Some(v) => match v {
+                    Value::Int(count) => Some(*count),
+                    _ => None, // Bad value in 'entityCount' attribute
+                },
+            },
+        };
+        match count {
+            Some(count) => Ok(count as u64),
+            None => conn.count_entities(&subgraph_id),
+        }
     }
 
     fn create_subgraph_deployment(
